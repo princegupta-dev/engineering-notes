@@ -1,0 +1,508 @@
+## 1. Why might `HELLO` and `WORLD` arrive together?
+
+Your answer:
+
+> It is not guaranteed that HELLO and WORLD will be treated as a single or different word by write(). TCP is not a simple request-response format, but it is a delivery of bytes.
+
+Verdict: Correct concept, but refine the terminology.
+
+TCP is a reliable, ordered byte stream. It does not preserve the boundaries of individual `socket.write()` calls.
+
+For example, the client sends:
+
+JavaScript
+
+```
+socket.write("HELLO");
+socket.write("WORLD");
+```
+
+The server might receive:
+
+```
+Event 1: HELLOWORLD
+```
+
+Or:
+
+```
+Event 1: HEL
+Event 2: LOWOR
+Event 3: LD
+```
+
+These are illustrative possibilities, not guaranteed delivery patterns. TCP guarantees the order of bytes, not the number or sizes of `'data'` events.
+
+### Why does this matter?
+
+Suppose you're building a custom TCP protocol for a backend service. If your server assumes every `'data'` event contains one complete message, it may parse incomplete messages or combine multiple messages incorrectly.
+
+You need a framing strategy, such as:
+
+- A length prefix specifying the message size.
+
+- A delimiter, provided the protocol handles delimiter escaping correctly.
+
+- A protocol format with explicit message boundaries.
+
+### Interview-ready answer
+
+> TCP provides a reliable, ordered byte stream, not message boundaries. Multiple writes may arrive in one data event, or one write may be delivered across multiple events. Therefore, a TCP application protocol needs framing, such as a length prefix or delimiter, so the receiver can identify complete messages.
+
+## 2. Why can one synchronous computation block thousands of connections?
+
+Your answer:
+
+> If one request performs a 5-second synchronous computation, it can block the main thread, and other callbacks or requests will keep waiting, so nodejs delegates the task to libuv or the operating system for network calls or file I/O, and executes the output of that work.
+
+Verdict: Mostly correct. The important correction is that Node.js does not automatically delegate arbitrary CPU-intensive JavaScript to libuv.
+
+Let's separate two kinds of work.
+
+Asynchronous I/O
+
+For network requests and supported asynchronous file operations, Node.js can wait for I/O without blocking the JavaScript thread for the entire wait. The OS, runtime, and sometimes libuv's worker pool participate, depending on the operation.
+
+CPU-heavy synchronous JavaScript
+
+A five-second synchronous loop occupies the JavaScript thread for those five seconds. Node.js doesn't automatically move that JavaScript to another thread.
+
+Consider:
+
+JavaScript
+
+```
+app.get("/report", (req, res) => {
+  const result = expensiveSynchronousCalculation();
+  res.json(result);
+});
+```
+
+If that calculation takes five seconds, other JavaScript callbacks on the same event loop cannot run normally during that period. Incoming connections may remain open, but their application-level processing can be delayed.
+
+The key distinction is that having many open connections does not mean Node.js can execute all their JavaScript handlers simultaneously.
+
+### How would you fix it?
+
+The right fix depends on the workload:
+
+- For slow database or HTTP calls, use appropriate asynchronous APIs.
+
+- For CPU-intensive JavaScript, optimize the computation or use Worker Threads, potentially with a worker pool.
+
+- For durable background work involving retries and job state, use a queue such as BullMQ where appropriate.
+
+Don't simply increase `UV_THREADPOOL_SIZE` to fix a synchronous JavaScript loop. The libuv worker pool doesn't automatically execute arbitrary JavaScript from your route handler.
+
+### Interview-ready answer
+
+> Node.js can maintain many concurrent network connections because network I/O is coordinated through the OS and runtime rather than requiring one JavaScript thread per connection. However, JavaScript callbacks on a given main thread execute one at a time. A five-second synchronous computation blocks that thread, delaying other requests and callbacks. I'd use asynchronous I/O for waiting operations and optimize or offload CPU-heavy JavaScript to Worker Threads when justified.
+
+## 3. Why reuse outgoing connections?
+
+Your answer:
+
+> If my service makes 500 requests per second to a third-party API, and opening a fresh connection per request can cause latency and server or network cost, so instead we can reuse the established connection.
+
+Verdict: Correct direction. Now add the senior-level trade-offs.
+
+Creating a new connection for every request can repeatedly incur TCP handshake overhead, and HTTPS may also incur TLS setup overhead. It can increase connection churn, consume ephemeral ports and file descriptors, and put additional load on the client and upstream service.
+
+Connection reuse can reduce that overhead. A pool can also bound the number of active connections.
+
+But pooling isn't automatically the answer to every slow API. Before changing the design, I'd investigate:
+
+1. Latency breakdown: How much time is spent establishing connections versus waiting for upstream responses?
+
+2. Connection reuse: Are HTTP keep-alive and the client's connection-reuse features configured as expected?
+
+3. Concurrency and queueing: Are requests waiting for available connections in a pool?
+
+4. Upstream limits: Does the third-party service impose concurrency or rate limits?
+
+5. Failure behavior: Are there timeouts, stale connections, retries, or connection errors?
+
+6. Resource consumption: Are socket counts, file descriptors, ephemeral ports, and memory under pressure?
+
+### A key trade-off
+
+Suppose your pool allows only 10 active connections but your workload requires 500 concurrent upstream requests. Requests may queue behind those 10 connections.
+
+If you raise the limit too far, you could overload the upstream API or consume excessive local resources.
+
+The pool limit should reflect measured latency, expected concurrency, upstream capacity, and service limits—not simply the request rate.
+
+Also, 500 requests per second does not automatically mean you need 500 simultaneous connections. Concurrency depends heavily on how long requests remain in flight.
+
+### Interview-ready answer
+
+> Creating a fresh connection for every outgoing request can add TCP and TLS setup latency and increase connection churn. I'd investigate connection reuse, connection-establishment time, upstream latency, pool queueing, and connection errors. Then I'd configure a bounded connection pool with suitable timeouts and lifecycle management, balancing throughput against upstream capacity and local resource limits.
+
+## The three concepts you should remember
+
+TCP
+
+Reliable, ordered bytes; message boundaries must be defined by the application protocol.
+
+Concurrency
+
+Many I/O operations can be in flight, but synchronous JavaScript blocks other callbacks on the same thread.
+
+Connection pooling
+
+Reuse connections to reduce setup overhead, while managing pool limits, timeouts, and upstream capacity.
+
+# Networking Internals in Node.js
+
+Imagine your Fills e-commerce backend runs on Node.js and NestJS. At 10 AM, thousands of users open the app simultaneously. They request products, check prices, and add items to their carts.
+
+Your API handles many requests at once, but here's the question:
+
+How can one Node.js process manage thousands of network connections when JavaScript executes on a single main thread?
+
+To answer that, we need to understand TCP, sockets, HTTP, connection reuse, and how Node.js interacts with the operating system.
+
+## 1. The journey of an HTTP request
+
+![Mobile App Development for Beginners Guide - CatDoes](https://images.openai.com/static-rsc-4/kaxKT42btCdFrevY9lvdJQgEqBU6X2ocsV5TOH1KDYO6c5C_qqyr3pHL0GJpOOz85dgvoDLKAXdYajYEuUNPgVi6Vk7ot1X3hmOemQR-OM0pH1iUs51SUh64LhSLZtsv_90a1xfu_sbiZszBmHTrTaKVojX44aZxYWyqY-hSVv4?purpose=inline)
+
+Suppose your Flutter app makes this request:
+
+http
+
+```
+GET /products/123 HTTP/1.1
+Host: api.example.com
+```
+
+The request travels through several layers before your controller executes.
+
+1. Flutter application
+
+Creates an HTTP request
+
+2. Network and TCP
+
+Establishes a reliable byte stream between endpoints
+
+3. Operating system + Node.js
+
+Socket readiness and network data handling
+
+4. HTTP server and NestJS
+
+Parses the request and runs middleware, guards, and controllers
+
+5. Response
+
+The result travels back over the connection
+
+These are logical layers, not necessarily five separate machines or processes.
+
+The key insight: Node.js does not need one JavaScript thread per connected client. Network I/O is generally coordinated through the operating system's socket mechanisms and libuv. JavaScript handles the relevant callbacks when the runtime can make progress on them.
+
+That is a major part of how Node.js supports high concurrency.
+
+## 2. TCP vs. HTTP: two different jobs
+
+Think of sending a letter.
+
+- TCP is like a reliable delivery service that transfers bytes in order and detects missing data.
+
+- HTTP is the agreed format for what those bytes mean: methods, paths, headers, status codes, and message bodies.
+
+TCP doesn't know what `/products/123` means. It transports bytes. HTTP defines the request and response semantics.
+
+|
+TCP
+
+|
+
+HTTP
+
+|
+| --- | --- |
+|
+
+Transport protocol
+
+|
+
+Application protocol
+
+|
+|
+
+Provides an ordered, reliable byte stream
+
+|
+
+Defines requests and responses
+
+|
+|
+
+Establishes a connection using a handshake
+
+|
+
+Uses that connection to exchange HTTP messages
+
+|
+|
+
+Doesn't understand JSON or API routes
+
+|
+
+Can carry JSON, text, images, and other content
+
+|
+
+A detail worth remembering: HTTP/1.1 and HTTP/2 commonly operate over TCP, while HTTP/3 uses QUIC over UDP. So HTTP is not inherently tied to TCP.
+
+## 3. What is a socket?
+
+A socket is an operating-system networking endpoint through which an application can communicate.
+
+In Node.js, you can work with TCP sockets directly using `node:net`, or use higher-level APIs such as `node:http` that manage HTTP communication on top of networking facilities.
+
+Imagine your server listens on port `3000`.
+
+JavaScript
+
+```
+const net = require("node:net");
+
+const server = net.createServer((socket) => {
+  console.log("Client connected");
+
+  socket.on("data", (data) => {
+    console.log("Received:", data.toString());
+    socket.write("Message received");
+  });
+
+  socket.on("end", () => {
+    console.log("Client ended its writable side");
+  });
+
+  socket.on("error", (err) => {
+    console.error("Socket error:", err.message);
+  });
+});
+
+server.listen(3000, () => {
+  console.log("TCP server listening on port 3000");
+});
+```
+
+Run this server, then connect with a TCP client such as `nc localhost 3000` if `nc` is available.
+
+When you type a message, Node.js receives a Buffer through the socket's `'data'` event and sends bytes back with `socket.write()`.
+
+Notice how our previous lessons connect:
+
+- Lesson 2: The event loop lets Node.js react to socket events.
+
+- Lesson 4: Network socket I/O is generally handled through OS readiness mechanisms, rather than consuming one libuv worker-pool thread per connection.
+
+- Lesson 5: Socket data can be handled incrementally as a stream.
+
+- Lesson 6: Incoming socket data is delivered as bytes, commonly represented by Buffers.
+
+### A critical TCP detail
+
+TCP is a byte stream, not a message protocol.
+
+If one client sends `"HELLO"` and then `"WORLD"`, your server might receive those bytes in one `'data'` event, two events, or another grouping. TCP does not preserve the boundaries of individual `write()` calls.
+
+This means you must not assume that one `'data'` event equals one complete application message. Protocols need framing—for example, a length prefix, a delimiter, or a well-defined HTTP message format.
+
+That distinction becomes essential when building custom TCP protocols or debugging partial network messages.
+
+## 4. How does Node.js manage many connections?
+
+Suppose 5,000 clients have open connections. Some are waiting for responses; some are sending data; others are idle.
+
+A simplified flow looks like this:
+
+Thousands of TCP sockets
+
+Operating system
+
+Tracks sockets and reports relevant readiness or completion events
+
+libuv and Node.js runtime
+
+Coordinates network I/O and schedules callbacks
+
+JavaScript callback execution
+
+Processes ready work on the main JS thread
+
+The OS can monitor many sockets without assigning a dedicated JavaScript thread to each one. When relevant network activity occurs, the runtime can arrange for the associated JavaScript work to run.
+
+However, this does not mean all 5,000 requests are processed simultaneously by JavaScript.
+
+JavaScript callbacks on a given main thread execute one at a time. While one callback waits asynchronously for network or database I/O, other work can proceed. If a callback performs a long synchronous computation, it blocks other callbacks on that thread.
+
+And open connections are not free: each consumes resources such as file descriptors, socket buffers, and runtime bookkeeping. High concurrency still requires resource limits, sensible timeouts, and backpressure.
+
+## 5. The hidden performance cost: creating a new connection for every request
+
+Imagine your API calls a third-party service to fetch shipping rates.
+
+Your server makes 100 requests to that service. If each request establishes a new TCP connection, the application repeatedly pays connection setup costs.
+
+For TCP, connection establishment normally involves a handshake. If HTTPS is used, TLS setup adds further work unless a connection can be reused or session mechanisms reduce the cost.
+
+This is where keep-alive matters.
+
+Without reuse
+
+### Repeated setup
+
+Request 1
+
+Connect → Request → Close
+
+Request 2
+
+Connect → Request → Close
+
+With reuse
+
+### Persistent connection
+
+Establish connection
+
+Request 1 → Response
+
+Request 2 → Response
+
+Reuse a connection where the protocol and client configuration permit it.
+
+HTTP keep-alive allows a connection to remain open for additional requests instead of closing after every response.
+
+In Node.js, distinguish two concepts:
+
+- HTTP persistence: whether an HTTP connection can serve multiple requests.
+
+- Connection pooling/reuse: whether your client retains and reuses connections to an upstream service.
+
+They are related but not identical.
+
+### Example: outgoing requests in Node.js
+
+Node.js's built-in `fetch()` supports connection reuse through its underlying networking implementation. For more explicit control over pooling and connection limits, you can use an HTTP client or configure an appropriate dispatcher/agent.
+
+For example, with the `undici` package:
+
+JavaScript
+
+```
+const { Pool } = require("undici");
+
+const pool = new Pool("https://api.example.com", {
+  connections: 10,
+});
+
+async function getProduct(id) {
+  const response = await pool.request({
+    path: `/products/${id}`,
+    method: "GET",
+  });
+
+  return response.body.json();
+}
+```
+
+This illustrates a pool of connections to one origin. In production, also handle response status codes, timeouts, retries where safe, and pool shutdown.
+
+Senior-engineer lesson: Reusing connections can reduce latency and connection overhead, but connection limits must be chosen carefully. Too few can create queues; too many can overload your upstream service.
+
+## 6. What happens when NestJS handles an HTTP request?
+
+Now connect the networking layer to your actual application.
+
+When you use NestJS with its Express or Fastify adapter, the high-level flow is approximately:
+
+Client sends HTTP request
+
+TCP socket receives bytes
+
+HTTP parser and adapter
+
+NestJS middleware, guards, pipes, interceptors, controller
+
+Service → MySQL / Redis / external APIs
+
+HTTP response sent to client
+
+This is a simplified view of Nest's request lifecycle; exact processing order depends on the adapter and features in use.
+
+Notice that TCP does not execute your controller. TCP transports the bytes. The HTTP server interprets the protocol, and NestJS routes the parsed request through your application.
+
+### A production scenario
+
+Suppose your product API becomes slow:
+
+- MySQL queries are taking 50 ms.
+
+- Redis calls are normal.
+
+- Requests still take 2 seconds.
+
+- Many clients have slow network connections.
+
+Possible causes include slow client uploads/downloads, excessive connection setup, event-loop blocking, proxy behavior, or application-level queuing. TCP and keep-alive are part of the investigation, but neither is automatically the cause.
+
+A senior engineer would inspect connection reuse, time-to-first-byte, request and response sizes, event-loop delay, upstream timings, socket errors, and connection-pool utilization before choosing a fix.
+
+## 7. Common networking mistakes
+
+Assuming TCP preserves message boundaries
+
+It preserves byte order, not individual write boundaries. Implement correct protocol framing.
+
+Opening unlimited connections
+
+Connection limits, timeouts, and pooling protect your process and upstream dependencies.
+
+Confusing concurrency with parallel JavaScript execution
+
+Many connections can be in flight concurrently, but callbacks on one main JS thread still execute one at a time.
+
+Ignoring slow consumers
+
+Large responses and slow clients can cause buffering. Stream responses and respect backpressure.
+
+## 8. Lesson 7 checkpoint
+
+Question 1
+
+TCP message boundaries
+
+Your TCP server receives `HELLO` and `WORLD` from a client that called `socket.write()` twice. Why can't your server assume it will receive exactly two `'data'` events?
+
+It is not guaranteed that HELLO and WORLD will be treated as a single or different word by write(). TCP is not a simple request-response format, but it is a delivery of bytes.
+
+Question 2
+
+Node.js concurrency
+
+How can one Node.js process keep thousands of sockets open without creating one JavaScript thread for every socket? What happens if one request performs a 5-second synchronous computation?
+
+If one request performs a 5-second synchronous computation, it can block the main thread, and other callbacks or requests will keep waiting, so nodejs delegates the task to libuv or the operating system for network calls or file I/O, and executes the output of that work.
+
+Question 3
+
+Production diagnosis
+
+Your NestJS service makes 500 requests per second to a third-party API. Each outgoing request creates a fresh connection. What performance problems could this cause, and what would you investigate before introducing connection pooling?
+
+If my service makes 500 requests per second to a third-party API, and opening a fresh connection per request can cause latency and server or network cost, so instead we can reuse the established connection.
+
+Review my answers
+
+Once you complete this lesson, we'll continue to Lesson 8 — Promises and Async Internals, covering promise scheduling, `async`/`await`, error propagation, and common production concurrency mistakes.
